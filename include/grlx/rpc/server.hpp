@@ -363,6 +363,42 @@ public:
     }
   }
 
+  // Fan-out form of notify_session: encode the payload ONCE and take ONE
+  // strand hop for the whole target set, instead of paying both per target.
+  // notify_session in a loop costs O(targets) serializations and O(targets)
+  // co_spawns onto sessions_strand_, which is what makes a second viewer on
+  // a high-rate stream (media packets, telemetry bursts) twice as expensive
+  // on the server rather than free.
+  template <typename... ArgsT>
+  auto notify_sessions(std::unordered_set<std::string> const& target_session_ids, std::string const& func_name, ArgsT&&... args)
+      -> asio::awaitable<void> {
+    if (!sessions_strand_ || target_session_ids.empty()) {
+      co_return;
+    }
+
+    message_request<typename std::decay<ArgsT>::type...> request{std::make_tuple(std::forward<ArgsT>(args)...)};
+
+    buffer_type buffer;
+    encoder_type::encode(buffer, request);
+
+    auto sessions_copy = co_await asio::co_spawn(
+        *sessions_strand_,
+        [this]() -> asio::awaitable<std::unordered_set<std::shared_ptr<session_type>>> {
+          co_return active_sessions_;
+        },
+        asio::use_awaitable);
+
+    for (auto& session : sessions_copy) {
+      auto const& sid = session->logical_session_id();
+      if (!target_session_ids.contains(sid)) {
+        continue;
+      }
+      if (!session->try_notify(func_name, buffer)) {
+        log_warning_async("notify_sessions: write channel full for " + sid + ", dropping " + func_name);
+      }
+    }
+  }
+
   template <typename... ArgsT>
   auto notify(std::string const& func_name, ArgsT&&... args) -> asio::awaitable<void> {
     if (!sessions_strand_) {
