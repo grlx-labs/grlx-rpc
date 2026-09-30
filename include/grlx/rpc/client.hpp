@@ -92,13 +92,19 @@ public:
     : channel_(std::forward<ArgsT>(args)...) {
   }
 
+  // Take the session, don't share it: a moved-from client must own nothing,
+  // or its destructor (below) would close the connection the new one uses.
   client(client&& other)
     : channel_(std::move(other.channel_))
-    , client_session_(other.client_session_.load())
+    , client_session_(other.client_session_.exchange(nullptr))
     , function_hash_cache_(std::move(other.function_hash_cache_)) {
   }
 
-  ~client() = default;
+  // Destroying a client closes its connection. The session keeps itself alive
+  // via shared_from_this() inside dispatch_requests(), so without this the
+  // socket stayed open after the client was gone and the server held a dead
+  // session until its idle_timeout reaped it.
+  ~client() { disconnect(); }
 
   client(client const&)            = delete;
   client& operator=(client const&) = delete;
