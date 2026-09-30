@@ -18,7 +18,7 @@ jobs:
     container: archlinux:latest
     steps:
       - name: Install toolchain
-        run: pacman -Syu --noconfirm --needed base-devel git meson ninja boost spdlog fmt gtest cereal
+        run: pacman -Syu --noconfirm --needed base-devel git meson ninja pkgconf cmake boost spdlog fmt gtest cereal
 
       - uses: actions/checkout@v4
         with:
