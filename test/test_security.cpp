@@ -858,8 +858,9 @@ TEST_F(rpc_security_test, close_sessions_if_closes_only_matching_sessions) {
     auto const fp_a = fp_seen;
     co_await b.connect(endpoint);
     EXPECT_EQ(co_await b.invoke<int>("ping"), 1);
-    ASSERT_EQ(fp_a.size(), 64u);
-    ASSERT_NE(fp_a, fp_seen) << "the two clients must have different fingerprints";
+    EXPECT_EQ(fp_a.size(), 64u);
+    EXPECT_NE(fp_a, fp_seen) << "the two clients must have different fingerprints";
+    if (fp_a.size() != 64u || fp_a == fp_seen) co_return;
 
     auto const closed = co_await server.close_sessions_if(
         [&](grlx::rpc::session_info const& info) { return info.peer_fingerprint == fp_a; });
