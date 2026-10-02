@@ -11,6 +11,8 @@
 #include <boost/asio/strand.hpp>
 
 #include <atomic>
+#include <cstddef>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -451,6 +453,40 @@ public:
   }
 
   // Gracefully close all sessions (strand-safe)
+  // Close every live session whose session_info matches — e.g. revoking one
+  // device's access by its peer_fingerprint while everyone else stays
+  // connected. Returns how many were closed; each still runs
+  // on_session_close and leaves active_sessions_ through its own teardown.
+  auto close_sessions_if(std::function<bool(session_info const&)> pred) -> asio::awaitable<std::size_t> {
+    if (!sessions_strand_ || !pred) {
+      co_return 0;
+    }
+
+    co_return co_await asio::co_spawn(
+        *sessions_strand_,
+        [this, pred = std::move(pred)]() -> asio::awaitable<std::size_t> {
+          std::size_t closed = 0;
+          for (auto& session : active_sessions_) {
+            session_info const info{
+                .peer_fingerprint = session->peer_fingerprint(),
+                .peer_address     = session->peer_address(),
+                .session_token    = reinterpret_cast<std::uint64_t>(session.get()),
+            };
+            if (!pred(info)) {
+              continue;
+            }
+            try {
+              session->close();
+              ++closed;
+            } catch (...) {
+              // Ignore errors during cleanup
+            }
+          }
+          co_return closed;
+        },
+        asio::use_awaitable);
+  }
+
   auto close_all_sessions() -> asio::awaitable<void> {
     if (!sessions_strand_) {
       co_return;

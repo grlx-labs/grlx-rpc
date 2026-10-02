@@ -81,6 +81,9 @@ inline void apply_tls_config(asio::ssl::context& ctx, tls_config const& cfg, boo
   if (server_side) {
     if (cfg.require_client_cert) {
       mode = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+    } else if (cfg.request_client_cert) {
+      // Optional mTLS: a presented cert is verified, a missing one is fine.
+      mode = SSL_VERIFY_PEER;
     }
   } else {
     if (cfg.verify_server_cert) {

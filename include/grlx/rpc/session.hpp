@@ -591,6 +591,42 @@ private:
     co_await queue_write(std::move(rsp_header), buffer_type(rsp_buffer));
   }
 
+  // Gatekeeper context for one inbound call (request or notification).
+  // Identity comes from the TLS handshake, which ran before this session was
+  // accepted, plus what an earlier handshake call bound to the session: the
+  // logical session id (server::notify_session targets it), the device
+  // identity and the authenticated role (enforce_auth gates on it). The
+  // setters let a handshake handler bind those after auth succeeds.
+  client_context make_call_context() {
+    std::weak_ptr<session> weak_self = this->shared_from_this();
+    return client_context{
+        .peer_fingerprint   = peer_fingerprint_,
+        .peer_address       = peer_address_,
+        .peer_ip            = peer_ip_,
+        .logical_session_id = logical_session_id_,
+        .set_logical_session_id =
+            [weak_self](std::string id) {
+              if (auto s = weak_self.lock()) {
+                s->set_logical_session_id(std::move(id));
+              }
+            },
+        .logical_device_id = logical_device_id_,
+        .set_logical_device_id =
+            [weak_self](std::string id) {
+              if (auto s = weak_self.lock()) {
+                s->set_logical_device_id(std::move(id));
+              }
+            },
+        .logical_role = logical_role_,
+        .set_logical_role =
+            [weak_self](int r) {
+              if (auto s = weak_self.lock()) {
+                s->set_logical_role(r);
+              }
+            },
+    };
+  }
+
   asio::awaitable<void> dispatch_request(header_type const& req_header) {
     // Run handlers on the raw io_context (stream_.get_executor()), NOT on
     // io_bound_executor_ — handlers run in parallel; only stream_ I/O is bound
@@ -636,44 +672,9 @@ private:
           try {
             auto& call_id = req_header[CALL_ID_IDX];
 
-            // Gatekeeper context. Identity comes from the TLS handshake,
-            // which ran before we accepted this session. The dispatcher
-            // enforces auth before invoking the handler — see enforce_auth.
-            // The set_logical_session_id callback lets the handler
-            // (typically a custom handshake) tag this session with a
-            // logical id for use by server::notify_session.
-            std::weak_ptr<session> weak_self = self;
-            client_context ctx{
-                .peer_fingerprint = self->peer_fingerprint_,
-                .peer_address     = self->peer_address_,
-                .peer_ip          = self->peer_ip_,
-                // The session id already bound at handshake; handlers read this
-                // to bind push subscriptions to the caller's own session.
-                .logical_session_id = self->logical_session_id_,
-                .set_logical_session_id = [weak_self](std::string id) {
-                  if (auto s = weak_self.lock()) {
-                    s->set_logical_session_id(std::move(id));
-                  }
-                },
-                // The device identity already bound to the session (by an earlier
-                // handshake call); handlers read this to authorize. The setter
-                // lets the handshake handler stamp it after auth succeeds.
-                .logical_device_id = self->logical_device_id_,
-                .set_logical_device_id = [weak_self](std::string id) {
-                  if (auto s = weak_self.lock()) {
-                    s->set_logical_device_id(std::move(id));
-                  }
-                },
-                // The authenticated role bound at handshake; the dispatcher's
-                // enforce_auth reads this to gate authenticated/admin methods.
-                // The setter lets the handshake handler stamp it after auth.
-                .logical_role = self->logical_role_,
-                .set_logical_role = [weak_self](int r) {
-                  if (auto s = weak_self.lock()) {
-                    s->set_logical_role(r);
-                  }
-                },
-            };
+            // Gatekeeper context — see make_call_context. The dispatcher
+            // enforces auth before invoking the handler (enforce_auth).
+            client_context ctx = self->make_call_context();
 
             // Make the ctx visible to the handler via
             // current_call_context() for the synchronous prefix of its
@@ -778,7 +779,13 @@ private:
             if (self->notification_callback_) {
               self->notification_callback_(call_id, buffer_data);
             } else {
-              self->dispatcher_->dispatch(call_id, buffer_data);
+              // Same auth gate as requests (WI-12): an inbound notification
+              // is a call too, and must not reach a handler the session isn't
+              // authorized for — the context-less dispatch overload skips
+              // enforce_auth entirely.
+              client_context ctx = self->make_call_context();
+              current_call_context_scope ctx_scope(&ctx);
+              self->dispatcher_->dispatch(call_id, buffer_data, ctx);
             }
           } catch (std::exception const& e) {
             self->log_error_async(std::string("Notification handling error: ") + e.what());

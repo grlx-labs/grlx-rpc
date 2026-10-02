@@ -113,6 +113,15 @@ struct tls_config {
   // When false, the server runs one-way TLS (server cert only).
   bool require_client_cert = true;
 
+  // Server side, only when require_client_cert is false: still REQUEST a
+  // client certificate. One that is presented must chain to a trusted CA or
+  // the handshake fails, as with require_client_cert; a client that presents
+  // none is let through with an empty peer_fingerprint, for the application
+  // to restrict — typically through the auth callback, to an enrollment method
+  // that hands the device its certificate. Ignored when require_client_cert
+  // is true.
+  bool request_client_cert = false;
+
   // Client side: verify the server's certificate against the trust
   // anchors loaded into the context. When false, any cert is accepted
   // (do not use on the public internet — MITM becomes trivial).

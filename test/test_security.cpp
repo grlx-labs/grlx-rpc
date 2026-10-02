@@ -711,3 +711,171 @@ TEST_F(rpc_security_test, auth_callback_sees_cert_fingerprint) {
     EXPECT_EQ(seen_method, "whoami");
   });
 }
+
+// --- Optional mTLS (tls_config::request_client_cert) -------------------------
+// The server asks for a client cert but doesn't require one: a client without
+// one gets in, and the auth callback sees an empty fingerprint — what an app
+// keys "this session may only enroll" on.
+TEST_F(rpc_security_test, optional_mtls_accepts_certless_client_with_empty_fingerprint) {
+  auto const& certs = shared_cert_set();
+
+  run([this, &certs]() -> asio::awaitable<void> {
+    grlx::rpc::server<ssl_ch> server{grlx::rpc::make_server_context(
+        certs.server.cert_pem, certs.server.key_pem, certs.primary_ca.cert_pem,
+        grlx::rpc::tls_config{.require_client_cert = false, .request_client_cert = true})};
+
+    std::string seen_fp = "unset";
+    server.set_auth_callback([&](grlx::rpc::client_context const& ctx, std::string const&) {
+      seen_fp = ctx.peer_fingerprint;
+      return grlx::rpc::auth_result{.allow = true};
+    });
+    auto endpoint = co_await start_ssl_server(server, [](auto& s) {
+      s.attach("ping", grlx::rpc::visibility::authenticated, []() -> int { return 1; });
+    });
+
+    grlx::rpc::client<ssl_ch> client{grlx::rpc::make_client_context("", "", certs.primary_ca.cert_pem)};
+    co_await client.connect(endpoint);
+    EXPECT_EQ(co_await client.invoke<int>("ping"), 1);
+    EXPECT_EQ(seen_fp, "") << "a cert-less session must reach the callback with an empty fingerprint";
+  });
+}
+
+// Optional mTLS still verifies a cert that IS presented: a valid one is
+// fingerprinted, one from an untrusted CA fails the handshake.
+TEST_F(rpc_security_test, optional_mtls_still_verifies_presented_certs) {
+  auto const& certs = shared_cert_set();
+
+  run([this, &certs]() -> asio::awaitable<void> {
+    grlx::rpc::server<ssl_ch> server{grlx::rpc::make_server_context(
+        certs.server.cert_pem, certs.server.key_pem, certs.primary_ca.cert_pem,
+        grlx::rpc::tls_config{.require_client_cert = false, .request_client_cert = true})};
+
+    std::string seen_fp;
+    server.set_auth_callback([&](grlx::rpc::client_context const& ctx, std::string const&) {
+      seen_fp = ctx.peer_fingerprint;
+      return grlx::rpc::auth_result{.allow = true};
+    });
+    auto endpoint = co_await start_ssl_server(server, [](auto& s) {
+      s.attach("ping", grlx::rpc::visibility::authenticated, []() -> int { return 1; });
+    });
+
+    grlx::rpc::client<ssl_ch> good{grlx::rpc::make_client_context(
+        certs.client_a.cert_pem, certs.client_a.key_pem, certs.primary_ca.cert_pem)};
+    co_await good.connect(endpoint);
+    EXPECT_EQ(co_await good.invoke<int>("ping"), 1);
+    EXPECT_EQ(seen_fp.size(), 64u) << "a presented cert must still be fingerprinted";
+
+    grlx::rpc::client<ssl_ch> rogue{grlx::rpc::make_client_context(
+        certs.rogue_client.cert_pem, certs.rogue_client.key_pem, certs.primary_ca.cert_pem)};
+    bool failed = false;
+    try {
+      co_await rogue.connect(endpoint);
+      co_await rogue.invoke<int>("ping");
+    } catch (std::exception const&) {
+      failed = true;
+    }
+    EXPECT_TRUE(failed) << "an untrusted-CA cert must still be rejected in optional mode";
+  });
+}
+
+// --- WI-12: inbound notifications go through the auth gate -------------------
+// A notification is an inbound call too. Hand-framed (the client API has no
+// way to send one), aimed at an authenticated method: with the callback
+// denying, the handler must not run; with it allowing, the same frame does —
+// which proves the frame was valid.
+TEST_F(rpc_security_test, notification_is_subject_to_auth_callback) {
+  run([this]() -> asio::awaitable<void> {
+    grlx::rpc::server<tcp_ch> server;
+    std::atomic<bool> allow{false};
+    std::atomic<int>  handler_runs{0};
+    server.set_auth_callback([&](grlx::rpc::client_context const&, std::string const&) {
+      return grlx::rpc::auth_result{.allow = allow.load(), .deny_reason = "nope"};
+    });
+    co_await start_tcp_server(server, [&](auto& s) {
+      s.attach("secret", grlx::rpc::visibility::authenticated, [&handler_runs]() -> int {
+        ++handler_runs;
+        return 0;
+      });
+    });
+
+    auto executor = co_await asio::this_coro::executor;
+    tcp::endpoint const ep{asio::ip::make_address("127.0.0.1"),
+                           static_cast<unsigned short>(server.channel().endpoint().port())};
+    tcp::socket sock(executor);
+    co_await sock.async_connect(ep, asio::use_awaitable);
+
+    grlx::rpc::buffer_type body;
+    grlx::rpc::binary_encoder::encode(body, grlx::rpc::message_request<>{});
+    auto send_notification = [&]() -> asio::awaitable<void> {
+      constexpr std::uint64_t kMsgTypeNotificationShifted = static_cast<std::uint64_t>(3) << 32;
+      wire_header hdr{kMagic, body.size(), kMsgTypeNotificationShifted,
+                      grlx::rpc::shash64("secret").value(), 0};
+      co_await asio::async_write(sock, asio::buffer(&hdr, sizeof(hdr)), asio::use_awaitable);
+      co_await asio::async_write(sock, asio::buffer(body), asio::use_awaitable);
+    };
+    auto settle = [&]() -> asio::awaitable<void> {
+      asio::steady_timer t(executor);
+      t.expires_after(300ms);
+      co_await t.async_wait(asio::use_awaitable);
+    };
+
+    co_await send_notification();
+    co_await settle();
+    EXPECT_EQ(handler_runs.load(), 0) << "a denied notification must not reach the handler";
+
+    allow = true;
+    co_await send_notification();
+    co_await settle();
+    EXPECT_EQ(handler_runs.load(), 1) << "control: the same notification runs when allowed";
+  });
+}
+
+// --- server::close_sessions_if -----------------------------------------------
+// Revoking one device: close the sessions with its fingerprint, leave the
+// others connected.
+TEST_F(rpc_security_test, close_sessions_if_closes_only_matching_sessions) {
+  auto const& certs = shared_cert_set();
+
+  run([this, &certs]() -> asio::awaitable<void> {
+    grlx::rpc::server<ssl_ch> server{grlx::rpc::make_server_context(
+        certs.server.cert_pem, certs.server.key_pem, certs.primary_ca.cert_pem)};
+
+    std::string fp_seen;
+    server.set_auth_callback([&](grlx::rpc::client_context const& ctx, std::string const&) {
+      fp_seen = ctx.peer_fingerprint;
+      return grlx::rpc::auth_result{.allow = true};
+    });
+    auto endpoint = co_await start_ssl_server(server, [](auto& s) {
+      s.attach("ping", grlx::rpc::visibility::authenticated, []() -> int { return 1; });
+    });
+
+    grlx::rpc::client<ssl_ch> a{grlx::rpc::make_client_context(
+        certs.client_a.cert_pem, certs.client_a.key_pem, certs.primary_ca.cert_pem)};
+    grlx::rpc::client<ssl_ch> b{grlx::rpc::make_client_context(
+        certs.client_b.cert_pem, certs.client_b.key_pem, certs.primary_ca.cert_pem)};
+    co_await a.connect(endpoint);
+    EXPECT_EQ(co_await a.invoke<int>("ping"), 1);
+    auto const fp_a = fp_seen;
+    co_await b.connect(endpoint);
+    EXPECT_EQ(co_await b.invoke<int>("ping"), 1);
+    ASSERT_EQ(fp_a.size(), 64u);
+    ASSERT_NE(fp_a, fp_seen) << "the two clients must have different fingerprints";
+
+    auto const closed = co_await server.close_sessions_if(
+        [&](grlx::rpc::session_info const& info) { return info.peer_fingerprint == fp_a; });
+    EXPECT_EQ(closed, 1u);
+
+    asio::steady_timer t(co_await asio::this_coro::executor);
+    t.expires_after(200ms);
+    co_await t.async_wait(asio::use_awaitable);
+
+    bool a_failed = false;
+    try {
+      co_await a.invoke<int>("ping");
+    } catch (std::exception const&) {
+      a_failed = true;
+    }
+    EXPECT_TRUE(a_failed) << "the closed session must not serve calls";
+    EXPECT_EQ(co_await b.invoke<int>("ping"), 1) << "the other session must be unaffected";
+  });
+}
