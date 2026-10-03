@@ -37,6 +37,7 @@ test_files = {
   'test_ssl':        {'sources': ['test_ssl.cpp']},
   'test_security':   {'sources': ['test_security.cpp']},
   'test_credentials': {'sources': ['test_credentials.cpp']},
+  'test_local':      {'sources': ['test_local.cpp']},
 }
 
 foreach name, spec : test_files
