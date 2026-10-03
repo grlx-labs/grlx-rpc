@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <memory>
+#include <type_traits>
 #include <unordered_map>
 
 namespace grlx::rpc {
@@ -255,7 +256,9 @@ public:
     // link to a fraction of capacity. Both client and server reach dispatch on
     // a connected socket, so set it once here for every session. Best-effort:
     // a failure to set it is not fatal.
-    {
+    // TCP only: a Unix-domain socket (local_channel) has no Nagle to disable.
+    using lowest_protocol = typename std::remove_cvref_t<decltype(stream_.lowest_layer())>::protocol_type;
+    if constexpr (std::is_same_v<lowest_protocol, asio::ip::tcp>) {
       boost::system::error_code nd_ec;
       stream_.lowest_layer().set_option(asio::ip::tcp::no_delay(true), nd_ec);
       if (nd_ec) {
