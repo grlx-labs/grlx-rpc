@@ -73,3 +73,21 @@ TEST_F(rpc_tcp_test, large_payload_roundtrip_256KiB) {
     EXPECT_EQ(response, payload);
   });
 }
+
+// A name can resolve to several addresses — "localhost" to ::1 and 127.0.0.1
+// — and a server may listen on only some of them. The fixture's server is
+// IPv4-only, so where "localhost" resolves to ::1 first this connect only
+// succeeds if the client moves on to the next address after a refusal.
+TEST_F(rpc_tcp_test, connect_by_name_tries_every_address) {
+  run([this]() -> asio::awaitable<void> {
+    grlx::rpc::server<tcp_ch> server;
+    auto address = co_await start_tcp_server(server, [](auto& s) {
+      s.attach("answer", []() -> int { return 42; });
+    });
+    auto const port = address.substr(address.rfind(':') + 1);
+
+    grlx::rpc::client<tcp_ch> client;
+    co_await client.connect("localhost:" + port);
+    EXPECT_EQ(co_await client.invoke<int>("answer"), 42);
+  });
+}

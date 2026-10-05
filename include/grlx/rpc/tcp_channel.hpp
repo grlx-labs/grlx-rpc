@@ -159,9 +159,13 @@ public:
 
     auto [host, port] = detail::parse_address(address);
     auto endpoints    = co_await resolver.async_resolve(host, port, asio::use_awaitable);
-    auto endpoint     = std::begin(endpoints);
-
-    co_return co_await connect(*endpoint);
+    // A name can resolve to several addresses — "localhost" to ::1 and
+    // 127.0.0.1, a dual-stack host to its AAAA and A records — and a server may
+    // listen on only some of them. Try each in resolver order until one
+    // connects.
+    for (auto const& entry : endpoints)
+      if (auto session = co_await connect(entry.endpoint())) co_return session;
+    co_return nullptr;
   }
 
   auto connect(tcp::endpoint const& endpoint) -> asio::awaitable<std::shared_ptr<session_type>> {

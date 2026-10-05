@@ -355,7 +355,14 @@ public:
     auto port      = colon_pos != std::string::npos ? address.substr(colon_pos + 1) : "0";
 
     auto endpoints = co_await resolver.async_resolve(host, port, asio::use_awaitable);
-    co_return co_await connect(*std::begin(endpoints));
+    // A name can resolve to several addresses — "localhost" to ::1 and
+    // 127.0.0.1, a dual-stack host to its AAAA and A records — and a server may
+    // listen on only some of them. Try each in resolver order: a failed TCP
+    // connect (null) moves on to the next, while a failure after connecting
+    // (e.g. the TLS handshake) still propagates — something answered there.
+    for (auto const& entry : endpoints)
+      if (auto session = co_await connect(entry.endpoint())) co_return session;
+    co_return nullptr;
   }
 
   auto connect(tcp::endpoint const& endpoint) -> asio::awaitable<std::shared_ptr<session_type>> {
