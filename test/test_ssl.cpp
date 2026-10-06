@@ -38,3 +38,20 @@ TEST_F(rpc_ssl_test, tls_roundtrip_echo) {
     EXPECT_EQ(response, "tls-ping");
   });
 }
+
+// See rpc_tcp_test.connect_by_name_tries_every_address: the IPv4-only server
+// is reached by name even where "localhost" resolves to ::1 first.
+TEST_F(rpc_ssl_test, connect_by_name_tries_every_address) {
+  auto const& certs = shared_cert_set();
+
+  run([this, &certs]() -> asio::awaitable<void> {
+    grlx::rpc::server<ssl_ch> server{make_server_ctx(certs.server, certs.primary_ca)};
+    auto endpoint = co_await start_ssl_server(server, [](auto& s) {
+      s.attach("echo", [](std::string const& payload) -> std::string { return payload; });
+    });
+
+    grlx::rpc::client<ssl_ch> client{make_insecure_client_ctx()};
+    co_await client.connect(std::format("localhost:{}", endpoint.port()));
+    EXPECT_EQ(co_await client.invoke<std::string>("echo", std::string("by-name")), "by-name");
+  });
+}
